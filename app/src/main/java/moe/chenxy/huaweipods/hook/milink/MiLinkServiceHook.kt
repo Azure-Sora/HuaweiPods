@@ -885,6 +885,11 @@ object MiLinkServiceHook : HookContext() {
     private var lowLatencyCardIcon: Drawable? = null
     private val ancPendingGate = MiLinkAncPendingGate()
     private val freeClip2AudioPendingGate = FreeClip2AudioPendingGate()
+    private var freeBuds7SpatialMode: FreeClip2SpatialAudioMode? = null
+    private var freeBuds7SpatialOwner: String? = null
+    private var freeBuds7SpatialRequestedAt = 0L
+    private var freeBuds7SpatialPending: FreeClip2SpatialAudioMode? = null
+    private var freeBuds7SpatialPendingAt = 0L
     private var lastFreeClip2AudioRefreshRequestAt = 0L
     private var lastHuaweiEqualizerRefreshRequestAt = 0L
     private var lastHuaweiAncRefreshRequestAt = 0L
@@ -929,6 +934,7 @@ object MiLinkServiceHook : HookContext() {
         hookWindowsHeadsetBondState()
         hookCirculatePlusHeadsetAncCard()
         hookCirculatePlusFreeClip2AudioEffectApi()
+        hookFreeBuds7SpatialRuntime()
         hookCirculatePlusFreeClip2AudioEffectCard()
         hookLowLatencyQuickCard()
         currentApplicationOrNull()?.let(::registerStatusReceiver)
@@ -2119,6 +2125,72 @@ object MiLinkServiceHook : HookContext() {
         }.onFailure { Log.w(TAG, "hook MiLink audio glasses classification skipped", it) }
     }
 
+    /** Query or set spatial audio through the owner-checked Bluetooth process bridge. */
+    private fun requestFreeBuds7Spatial(mode: FreeClip2SpatialAudioMode? = null) {
+        if (currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREEBUDS7) return
+        val address = currentAddress ?: return
+        val ctx = context ?: return
+        val now = SystemClock.elapsedRealtime()
+        if (!address.equals(freeBuds7SpatialOwner, ignoreCase = true)) {
+            freeBuds7SpatialMode = null
+            freeBuds7SpatialPending = null
+            freeBuds7SpatialRequestedAt = 0L
+            freeBuds7SpatialOwner = address
+        }
+        if (mode == null && now - freeBuds7SpatialRequestedAt < 1_500L) return
+        if (mode != null && mode == freeBuds7SpatialPending && now - freeBuds7SpatialPendingAt < 5_000L) return
+        freeBuds7SpatialRequestedAt = now
+        if (mode != null) {
+            freeBuds7SpatialPending = mode
+            freeBuds7SpatialPendingAt = now
+        }
+        val action = if (mode == null) HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_REFRESH
+            else HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_SET
+        ctx.sendBroadcast(
+            Intent(action).apply {
+                putExtra("address", address)
+                putExtra(
+                    HuaweiPodsAction.EXTRA_DEVICE_ROUTE,
+                    encodeHuaweiDeviceRouteForBroadcast(HuaweiDeviceRoute.HUAWEI_FREEBUDS7),
+                )
+                mode?.let { putExtra(HuaweiPodsAction.EXTRA_HUAWEI_SPATIAL_MODE, it.extraValue) }
+                setPackage("com.android.bluetooth")
+                addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+            },
+        )
+        Log.d(TAG, "FreeBuds 7 fusion spatial request mode=$mode")
+    }
+
+    /** Native runtime values differ from the card's display values and Huawei's wire values. */
+    private fun hookFreeBuds7SpatialRuntime() {
+        listOf(
+            "com.miui.headset.runtime.AncBatteryController" to "getMiAudioEffect",
+            "com.miui.headset.runtime.ProfileContext" to "getAudioSpatialEffectState",
+            "com.xiaomi.mxbluetoothsdk.manager.MxBluetoothManager" to "getSpatialMode",
+            "com.xiaomi.mxbluetoothsdk.service.MxBluetoothService" to "getSpatialMode",
+        ).forEach { (owner, method) ->
+            runCatching {
+                hookAfter(findMethod(owner, method, BluetoothDevice::class.java)) {
+                    val device = args[0] as? BluetoothDevice ?: return@hookAfter
+                    if (routeForDevice(device) != HuaweiDeviceRoute.HUAWEI_FREEBUDS7 || !isCurrentHuaweiDevice(device)) return@hookAfter
+                    captureRuntimeContext(instance)
+                    requestFreeBuds7Spatial()
+                    result = FreeBuds7MiLinkSpatialPolicy.runtime(freeBuds7SpatialMode)
+                }
+            }.onFailure { Log.w(TAG, "FreeBuds 7 spatial runtime unavailable $owner.$method", it) }
+        }
+        listOf("getAudioEffectState", "component10").forEach { method ->
+            runCatching {
+                hookAfter(findMethodByParamCount("com.miui.headset.api.HeadsetInfo", method, 0)) {
+                    if (routeForHeadsetInfo(instance) != HuaweiDeviceRoute.HUAWEI_FREEBUDS7 ||
+                        !isCurrentHeadsetInfo(instance, HuaweiDeviceRoute.HUAWEI_FREEBUDS7)) return@hookAfter
+                    requestFreeBuds7Spatial()
+                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode)
+                }
+            }.onFailure { Log.w(TAG, "FreeBuds 7 spatial display unavailable $method", it) }
+        }
+    }
+
     /**
      * 优先接管融合设备中心稳定的 HeadsetServiceController API。私有 w0 卡片 Hook 只负责
      * 当前系统版本的即时绘制，协议写入绝不能落到小米耳机实现。
@@ -2143,6 +2215,11 @@ object MiLinkServiceHook : HookContext() {
             ) {
                 val serviceInfo = args[0] ?: return@hookAfter
                 loadState()
+                if (currentHuaweiRoute() == HuaweiDeviceRoute.HUAWEI_FREEBUDS7 && isTargetCirculateHeadset(serviceInfo)) {
+                    requestFreeBuds7Spatial()
+                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode)
+                    return@hookAfter
+                }
                 if (currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREECLIP2 ||
                     !isTargetCirculateHeadset(serviceInfo)
                 ) {
@@ -2163,6 +2240,12 @@ object MiLinkServiceHook : HookContext() {
             ) {
                 val serviceInfo = args[0] ?: return@hookBefore
                 loadState()
+                if (currentHuaweiRoute() == HuaweiDeviceRoute.HUAWEI_FREEBUDS7 && isTargetCirculateHeadset(serviceInfo)) {
+                    val mode = FreeBuds7MiLinkSpatialPolicy.fromDisplay(args[1] as? Int ?: -1)
+                    if (mode != null) requestFreeBuds7Spatial(mode)
+                    result = CompletableFuture.completedFuture(if (mode != null) 100 else 208)
+                    return@hookBefore
+                }
                 if (currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREECLIP2 ||
                     !isTargetCirculateHeadset(serviceInfo)
                 ) {
@@ -2216,6 +2299,11 @@ object MiLinkServiceHook : HookContext() {
                 },
             ) {
                 val section = instance ?: return@hookBefore
+                if (freeClip2RouteForAudioEffectSection(section) == HuaweiDeviceRoute.HUAWEI_FREEBUDS7) {
+                    if (freeClip2AudioInternalRenderDepth.get() == 0) requestFreeBuds7Spatial()
+                    proceedWithArgs(FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode))
+                    return@hookBefore
+                }
                 if (freeClip2RouteForAudioEffectSection(section) != HuaweiDeviceRoute.HUAWEI_FREECLIP2) {
                     return@hookBefore
                 }
@@ -2257,6 +2345,15 @@ object MiLinkServiceHook : HookContext() {
                 ).apply { isAccessible = true },
             ) {
                 val section = instance ?: return@hookBefore
+                if (freeClip2RouteForAudioEffectSection(section) == HuaweiDeviceRoute.HUAWEI_FREEBUDS7) {
+                    if (shouldDispatchFreeClip2AudioSelection(freeClip2AudioInternalRenderDepth.get())) {
+                        FreeBuds7MiLinkSpatialPolicy.fromDisplay(args[1] as? Int ?: -1)
+                            ?.let { requestFreeBuds7Spatial(it) }
+                        freeBuds7SpatialMode?.let { renderFreeClip2AudioEffectMode(section, it) }
+                        result = null
+                    }
+                    return@hookBefore
+                }
                 if (freeClip2RouteForAudioEffectSection(section) != HuaweiDeviceRoute.HUAWEI_FREECLIP2) {
                     return@hookBefore
                 }
@@ -2319,6 +2416,10 @@ object MiLinkServiceHook : HookContext() {
         }
         val detailView = detail as? View
         when (routeForAncCardDetail(detail)) {
+            HuaweiDeviceRoute.HUAWEI_FREEBUDS7 -> {
+                requestFreeBuds7Spatial()
+                freeBuds7SpatialMode?.let { renderFreeClip2AudioEffectMode(section, it) }
+            }
             HuaweiDeviceRoute.HUAWEI_FREECLIP2 -> {
                 detailView?.let { root ->
                     restoreHuaweiEqualizerControls(root)
@@ -2367,7 +2468,9 @@ object MiLinkServiceHook : HookContext() {
             callMethod(
                 section,
                 hostSpec.renderMethodName,
-                miLinkAudioEffectForFreeClip2SpatialMode(mode, hostSpec),
+                if (freeClip2RouteForAudioEffectSection(section) == HuaweiDeviceRoute.HUAWEI_FREEBUDS7)
+                    FreeBuds7MiLinkSpatialPolicy.display(mode)
+                else miLinkAudioEffectForFreeClip2SpatialMode(mode, hostSpec),
             )
         } finally {
             freeClip2AudioInternalRenderDepth.decrementAndGet()
@@ -2916,6 +3019,13 @@ object MiLinkServiceHook : HookContext() {
             return
         }
         bindMiLinkVolumeProgress(root, label, route)
+        // Some hosts render the percentage in a separate sibling TextView.
+        val siblingLabels = (label.parent as? ViewGroup)?.let(::collectTextViews).orEmpty()
+            .filter { it !== label }.map { it.text.toString() }
+        if (FreeClip2MiLinkUiPolicy.hasNativeVolumePercentage(siblingLabels)) {
+            if (label.text != original) label.text = original
+            return
+        }
         val percent = volumePercent ?: currentMediaVolumePercent() ?: return
         val originalText = original.toString().trim()
         val rendered = if (Regex("\\d{1,3}%").containsMatchIn(originalText)) {
@@ -4416,6 +4526,7 @@ object MiLinkServiceHook : HookContext() {
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_PODS_ANC_CHANGED)
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_HUAWEI_ANC_LEVEL_CHANGED)
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_FREECLIP2_AUDIO_CHANGED)
+            addHuaweiPodsAction(HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_CHANGED)
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_HUAWEI_EQUALIZER_CHANGED)
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_HUAWEI_LOW_LATENCY_CHANGED)
             addHuaweiPodsAction(HuaweiPodsAction.ACTION_POD_IMAGES_CHANGED)
@@ -4547,6 +4658,31 @@ object MiLinkServiceHook : HookContext() {
                             ?: return
                         saveState(context)
                         refreshAncPresentation("anc-level-changed", refreshDetails = false)
+                    }
+                    HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_CHANGED -> {
+                        if (!matchesMiLinkStateOwner(
+                                currentAddress,
+                                currentHuaweiRoute(),
+                                receivedIntent.getStringExtra("address"),
+                                decodeHuaweiDeviceRouteFromBroadcast(
+                                    receivedIntent.getStringExtra(HuaweiPodsAction.EXTRA_DEVICE_ROUTE),
+                                ) ?: HuaweiDeviceRoute.UNSUPPORTED,
+                            )
+                        ) return
+                        if (!rememberSupportedDevice(receivedIntent)) return
+                        if (currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREEBUDS7) return
+                        val mode = FreeClip2SpatialAudioMode.fromExtraValue(
+                            receivedIntent.getStringExtra(HuaweiPodsAction.EXTRA_HUAWEI_SPATIAL_MODE),
+                        ) ?: return
+                        if (freeBuds7SpatialPending != null && freeBuds7SpatialPending != mode &&
+                            SystemClock.elapsedRealtime() - freeBuds7SpatialPendingAt < 5_000L
+                        ) return
+                        freeBuds7SpatialPending = null
+                        freeBuds7SpatialOwner = currentAddress
+                        freeBuds7SpatialMode = mode
+                        currentSessionConfirmed = true
+                        refreshFreeClip2AudioEffectSections("freebuds7-spatial-confirmed")
+                        Log.i(TAG, "FreeBuds 7 fusion spatial confirmed mode=$mode")
                     }
                     HuaweiPodsAction.ACTION_FREECLIP2_AUDIO_CHANGED -> {
                         if (!receivedIntent.getBooleanExtra(
@@ -4918,7 +5054,13 @@ object MiLinkServiceHook : HookContext() {
     ) {
         if (binding.hostSpec.adapterName != "legacy") return
         val hostState = miLinkAncDisplayState(binding.hostSpec)
-        if (binding.renderedHostAncState == hostState || binding.pendingHostAncState == hostState) return
+        // Legacy MiLink can repaint an old selection after its async command callback.
+        // For FreeBuds 7, reapply confirmed readbacks even if our last render matched:
+        // that cache does not describe the host's current visual state.
+        if (binding.pendingHostAncState == hostState ||
+            binding.renderedHostAncState == hostState &&
+            currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREEBUDS7
+        ) return
         val detail = binding.detail.get() as? View ?: return
         val clearView = resolveAncTransparencyView(card, binding, detail)
             ?: binding.clearView?.get()
@@ -5384,6 +5526,10 @@ object MiLinkServiceHook : HookContext() {
     }
 
     private fun resetFreeClip2AudioState() {
+        freeBuds7SpatialMode = null
+        freeBuds7SpatialOwner = null
+        freeBuds7SpatialPending = null
+        freeBuds7SpatialRequestedAt = 0L
         currentFreeClip2SpatialMode = FreeClip2SpatialAudioMode.OFF
         currentFreeClip2SpatialScene = FreeClip2SpatialScene.DEFAULT
         currentFreeClip2SoundEffect = FreeClip2SoundEffect.DEFAULT
