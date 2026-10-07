@@ -23,3 +23,31 @@ internal object FreeBuds7MiLinkSpatialPolicy {
         else -> display(mode)
     }
 }
+
+/** Pending writes only suppress duplicate requests; device readback is authoritative. */
+internal class FreeBuds7MiLinkSpatialState {
+    var mode: FreeClip2SpatialAudioMode? = null
+        private set
+    private var pending: FreeClip2SpatialAudioMode? = null
+    private var pendingAt = 0L
+
+    fun request(mode: FreeClip2SpatialAudioMode, now: Long): Boolean {
+        if (mode == pending && now - pendingAt < 5_000L) return false
+        pending = mode
+        pendingAt = now
+        return true
+    }
+
+    fun confirm(mode: FreeClip2SpatialAudioMode) {
+        // A failed write can read back the original mode before the pending timeout.
+        // Accept it immediately so the card recovers and the user can retry.
+        pending = null
+        this.mode = mode
+    }
+
+    fun clear() {
+        mode = null
+        pending = null
+        pendingAt = 0L
+    }
+}

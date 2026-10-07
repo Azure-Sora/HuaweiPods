@@ -885,11 +885,9 @@ object MiLinkServiceHook : HookContext() {
     private var lowLatencyCardIcon: Drawable? = null
     private val ancPendingGate = MiLinkAncPendingGate()
     private val freeClip2AudioPendingGate = FreeClip2AudioPendingGate()
-    private var freeBuds7SpatialMode: FreeClip2SpatialAudioMode? = null
+    private val freeBuds7SpatialState = FreeBuds7MiLinkSpatialState()
     private var freeBuds7SpatialOwner: String? = null
     private var freeBuds7SpatialRequestedAt = 0L
-    private var freeBuds7SpatialPending: FreeClip2SpatialAudioMode? = null
-    private var freeBuds7SpatialPendingAt = 0L
     private var lastFreeClip2AudioRefreshRequestAt = 0L
     private var lastHuaweiEqualizerRefreshRequestAt = 0L
     private var lastHuaweiAncRefreshRequestAt = 0L
@@ -2132,18 +2130,13 @@ object MiLinkServiceHook : HookContext() {
         val ctx = context ?: return
         val now = SystemClock.elapsedRealtime()
         if (!address.equals(freeBuds7SpatialOwner, ignoreCase = true)) {
-            freeBuds7SpatialMode = null
-            freeBuds7SpatialPending = null
+            freeBuds7SpatialState.clear()
             freeBuds7SpatialRequestedAt = 0L
             freeBuds7SpatialOwner = address
         }
         if (mode == null && now - freeBuds7SpatialRequestedAt < 1_500L) return
-        if (mode != null && mode == freeBuds7SpatialPending && now - freeBuds7SpatialPendingAt < 5_000L) return
+        if (mode != null && !freeBuds7SpatialState.request(mode, now)) return
         freeBuds7SpatialRequestedAt = now
-        if (mode != null) {
-            freeBuds7SpatialPending = mode
-            freeBuds7SpatialPendingAt = now
-        }
         val action = if (mode == null) HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_REFRESH
             else HuaweiPodsAction.ACTION_HUAWEI_SPATIAL_SET
         ctx.sendBroadcast(
@@ -2175,7 +2168,7 @@ object MiLinkServiceHook : HookContext() {
                     if (routeForDevice(device) != HuaweiDeviceRoute.HUAWEI_FREEBUDS7 || !isCurrentHuaweiDevice(device)) return@hookAfter
                     captureRuntimeContext(instance)
                     requestFreeBuds7Spatial()
-                    result = FreeBuds7MiLinkSpatialPolicy.runtime(freeBuds7SpatialMode)
+                    result = FreeBuds7MiLinkSpatialPolicy.runtime(freeBuds7SpatialState.mode)
                 }
             }.onFailure { Log.w(TAG, "FreeBuds 7 spatial runtime unavailable $owner.$method", it) }
         }
@@ -2185,7 +2178,7 @@ object MiLinkServiceHook : HookContext() {
                     if (routeForHeadsetInfo(instance) != HuaweiDeviceRoute.HUAWEI_FREEBUDS7 ||
                         !isCurrentHeadsetInfo(instance, HuaweiDeviceRoute.HUAWEI_FREEBUDS7)) return@hookAfter
                     requestFreeBuds7Spatial()
-                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode)
+                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialState.mode)
                 }
             }.onFailure { Log.w(TAG, "FreeBuds 7 spatial display unavailable $method", it) }
         }
@@ -2217,7 +2210,7 @@ object MiLinkServiceHook : HookContext() {
                 loadState()
                 if (currentHuaweiRoute() == HuaweiDeviceRoute.HUAWEI_FREEBUDS7 && isTargetCirculateHeadset(serviceInfo)) {
                     requestFreeBuds7Spatial()
-                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode)
+                    result = FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialState.mode)
                     return@hookAfter
                 }
                 if (currentHuaweiRoute() != HuaweiDeviceRoute.HUAWEI_FREECLIP2 ||
@@ -2301,7 +2294,7 @@ object MiLinkServiceHook : HookContext() {
                 val section = instance ?: return@hookBefore
                 if (freeClip2RouteForAudioEffectSection(section) == HuaweiDeviceRoute.HUAWEI_FREEBUDS7) {
                     if (freeClip2AudioInternalRenderDepth.get() == 0) requestFreeBuds7Spatial()
-                    proceedWithArgs(FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialMode))
+                    proceedWithArgs(FreeBuds7MiLinkSpatialPolicy.display(freeBuds7SpatialState.mode))
                     return@hookBefore
                 }
                 if (freeClip2RouteForAudioEffectSection(section) != HuaweiDeviceRoute.HUAWEI_FREECLIP2) {
@@ -2349,7 +2342,7 @@ object MiLinkServiceHook : HookContext() {
                     if (shouldDispatchFreeClip2AudioSelection(freeClip2AudioInternalRenderDepth.get())) {
                         FreeBuds7MiLinkSpatialPolicy.fromDisplay(args[1] as? Int ?: -1)
                             ?.let { requestFreeBuds7Spatial(it) }
-                        freeBuds7SpatialMode?.let { renderFreeClip2AudioEffectMode(section, it) }
+                        freeBuds7SpatialState.mode?.let { renderFreeClip2AudioEffectMode(section, it) }
                         result = null
                     }
                     return@hookBefore
@@ -2418,7 +2411,7 @@ object MiLinkServiceHook : HookContext() {
         when (routeForAncCardDetail(detail)) {
             HuaweiDeviceRoute.HUAWEI_FREEBUDS7 -> {
                 requestFreeBuds7Spatial()
-                freeBuds7SpatialMode?.let { renderFreeClip2AudioEffectMode(section, it) }
+                freeBuds7SpatialState.mode?.let { renderFreeClip2AudioEffectMode(section, it) }
             }
             HuaweiDeviceRoute.HUAWEI_FREECLIP2 -> {
                 detailView?.let { root ->
@@ -4674,12 +4667,8 @@ object MiLinkServiceHook : HookContext() {
                         val mode = FreeClip2SpatialAudioMode.fromExtraValue(
                             receivedIntent.getStringExtra(HuaweiPodsAction.EXTRA_HUAWEI_SPATIAL_MODE),
                         ) ?: return
-                        if (freeBuds7SpatialPending != null && freeBuds7SpatialPending != mode &&
-                            SystemClock.elapsedRealtime() - freeBuds7SpatialPendingAt < 5_000L
-                        ) return
-                        freeBuds7SpatialPending = null
                         freeBuds7SpatialOwner = currentAddress
-                        freeBuds7SpatialMode = mode
+                        freeBuds7SpatialState.confirm(mode)
                         currentSessionConfirmed = true
                         refreshFreeClip2AudioEffectSections("freebuds7-spatial-confirmed")
                         Log.i(TAG, "FreeBuds 7 fusion spatial confirmed mode=$mode")
@@ -5044,8 +5033,8 @@ object MiLinkServiceHook : HookContext() {
 
     /**
      * legacy 卡片没有等价于新版 M(int) 的刷新入口。复用它自身的按钮监听器最稳定：
-     * callOnClick() 只执行卡片内部选中态切换，不产生点击音效；控制 API 会被同步深度拦截，
-     * 因此不会重复向耳机写指令。
+     * callOnClick() 会执行宿主监听器（包括触感反馈），只在实际选中态不符时调用。
+     * 控制 API 会被同步深度拦截，因此不会重复向耳机写指令。
      */
     private fun scheduleLegacyAncCardState(
         card: Any,
@@ -5070,11 +5059,18 @@ object MiLinkServiceHook : HookContext() {
             Log.w(TAG, "MiLink legacy ANC button missing state=$hostState reason=$reason")
             return
         }
+        // Inspect the live view, not our render cache: host async callbacks can change it.
+        // Replaying an already selected button on every poll also repeats MIUI haptics.
+        if (target.isSelected) return
         binding.pendingHostAncState = hostState
         postTracked(target) {
             if (binding.pendingHostAncState != hostState ||
                 miLinkAncDisplayState(binding.hostSpec) != hostState
             ) {
+                return@postTracked
+            }
+            if (target.isSelected) {
+                binding.pendingHostAncState = null
                 return@postTracked
             }
             val handled = withMiLinkAncUiSync(ancInternalUiSyncDepth) {
@@ -5526,9 +5522,8 @@ object MiLinkServiceHook : HookContext() {
     }
 
     private fun resetFreeClip2AudioState() {
-        freeBuds7SpatialMode = null
+        freeBuds7SpatialState.clear()
         freeBuds7SpatialOwner = null
-        freeBuds7SpatialPending = null
         freeBuds7SpatialRequestedAt = 0L
         currentFreeClip2SpatialMode = FreeClip2SpatialAudioMode.OFF
         currentFreeClip2SpatialScene = FreeClip2SpatialScene.DEFAULT
